@@ -22,12 +22,16 @@ This will connect to Consul on `localhost:8500` (this is why we need `--net host
 Here are the `ENV` var available, and their default value:
 
 ```yml
-# Consul local agent address (see [Consul API](https://github.com/hashicorp/consul/blob/master/api/api.go) for other ENV var)
+# Consul local agent address
 CONSUL_HTTP_ADDR: http://localhost:8500
 
-# debug, info, warn, error, fatal, panic (see [Logrus API](https://github.com/sirupsen/logrus/blob/master/logrus.go))
+# debug, info, warn, error, fatal, panic
 LOG_LEVEL: info
 
 # the container local (and symetricly host mounted) folder where to put the project files
 EXECUTANT_WORK_DIR: /var/lib/executant
 ```
+
+see [Consul API](https://github.com/hashicorp/consul/blob/master/api/api.go) for other ENV var
+
+see [Logrus API](https://github.com/sirupsen/logrus/blob/master/logrus.go)
