@@ -2,140 +2,166 @@ package main
 
 import (
 	consulapi "github.com/hashicorp/consul/api"
-	log "github.com/sirupsen/logrus"
-	"io/ioutil"
 	"os"
+	"log"
+	"time"
+	"gopkg.in/yaml.v2"
+	"strings"
+	"path/filepath"
+	"io/ioutil"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
-	"time"
 )
+
+type loggerWriter struct {
+	l *log.Logger
+}
+
+func (l *loggerWriter) Write(p []byte) (n int, err error) {
+	l.l.Print(string(p))
+	return len(p), nil
+}
 
 func main() {
 
-	if logLevelEnv := os.Getenv("LOG_LEVEL"); logLevelEnv != "" {
-		logLevel, err := log.ParseLevel(logLevelEnv)
-		if err != nil {
-			log.Fatal("Invalid log level: ", err)
-		}
-		log.SetLevel(logLevel)
-	}
+	logger := log.New(os.Stdout, "", log.Ldate|log.Ltime|log.LUTC)
+	loggerWriter := loggerWriter{logger}
 
-	keys := os.Args[1:]
-	if len(keys) == 0 {
-		log.Fatal("At least one key is required")
+	key := "executant.yml"
+	if keyEnv := os.Getenv("EXECUTANT_KEY"); keyEnv != "" {
+		key = keyEnv
 	}
+	logger.Printf("%20s: %s", "EXECUTANT_KEY", key)
+
+	filters := []string{"executant.enabled=true"}
+	if filtersEnv := os.Getenv("EXECUTANT_FILTERS"); filtersEnv != "" {
+		filters = strings.Split(filtersEnv, ",")
+	}
+	logger.Printf("%20s: %v", "EXECUTANT_FILTERS", filters)
 
 	workDir := "/var/lib/executant"
 	if workDirEnv := os.Getenv("EXECUTANT_WORK_DIR"); workDirEnv != "" {
 		workDir = workDirEnv
 	}
-	log.Debug("Work dir ", workDir)
+	logger.Printf("%20s: %v", "EXECUTANT_WORK_DIR", workDir)
 
-	config := consulapi.DefaultConfig()
-	client, err := consulapi.NewClient(config)
-	if err != nil {
-		log.Fatal("Can not create a Consul API client: ", err)
-	}
-
-	for {
-		leader, err := client.Status().Leader()
-		if err != nil {
-			log.Warn("Can not contact a Consul loader: ", err)
-			time.Sleep(time.Second)
-		} else {
-			log.Debug("Consul loader: ", leader)
-			break
-		}
-	}
-
-	for i := 0; i < len(keys); i++ {
-		go work(client, workDir, keys[i])
-	}
-
-	// trap ctrl-c
-	signalChan := make(chan os.Signal, 1)
-	signal.Notify(signalChan, os.Interrupt)
-	chanSignal := <-signalChan
-	log.Debug("Got signal: ", chanSignal)
-
-	for i := 0; i < len(keys); i++ {
-		update(filepath.Join(workDir, keys[i]), "")
-	}
-}
-
-func work(client *consulapi.Client, workDir string, key string) {
-	projectDir := filepath.Join(workDir, key)
-	log.Debug("Key ", key, " project dir ", projectDir)
-	if err := os.MkdirAll(projectDir, os.ModePerm); err != nil {
-		log.Error("Error while mkdir ", projectDir)
+	if err := os.MkdirAll(workDir, os.ModePerm); err != nil {
+		logger.Fatalf("Unable to create working folder: %v", err)
 		return
 	}
-	queryOptions := consulapi.QueryOptions{
-		WaitIndex: 0,
-		WaitTime:  5 * time.Minute,
-	}
-	for {
-		keyPair, _, err := client.KV().Get(key, &queryOptions)
-		if err != nil {
-			log.Warn("Error while getting key ", key, " from Consul: ", err)
-			time.Sleep(5 * time.Second)
-		} else if keyPair == nil {
-			log.Debug("Empty response for key ", key)
-			update(projectDir, "")
-			time.Sleep(5 * time.Second)
-		} else if keyPair.ModifyIndex == queryOptions.WaitIndex {
-			log.Debug("No change for key ", key)
-		} else if keyPair.Value == nil {
-			log.Debug("Empty value for key ", key)
-			update(projectDir, "")
-			queryOptions.WaitIndex = keyPair.ModifyIndex
-		} else if keyPair != nil && keyPair.Value != nil {
-			yml := string(keyPair.Value)
-			log.Debug("Value for key ", key, " is ", yml)
-			update(projectDir, yml)
-			queryOptions.WaitIndex = keyPair.ModifyIndex
-		}
-	}
-}
 
-func update(projectDir string, yml string) {
-	projectFile := filepath.Join(projectDir, "docker-compose.yml")
-	if yml == "" {
-		if fileInfo, err := os.Stat(projectFile); fileInfo != nil && err == nil {
-			cmd := exec.Command("docker-compose", "down", "--remove-orphans")
-			log.Info("Execute docker-compose down in ", projectDir)
-			cmd.Dir = projectDir
-			if log.GetLevel() >= log.InfoLevel {
-				cmd.Stdout = os.Stdout
-				cmd.Stderr = os.Stderr
+	composeFilePath := filepath.Join(workDir, "docker-compose.yml")
+	logger.Print("Compose file ", composeFilePath)
+
+	consul, err := consulapi.NewClient(consulapi.DefaultConfig())
+	if err != nil {
+		logger.Fatalf("Unable to create Consul API client: %v", err)
+	}
+
+	go func() {
+
+		qo := consulapi.QueryOptions{}
+		qo.WaitTime = 1 * time.Minute
+
+		for {
+
+			kv, _, err := consul.KV().Get(key, &qo)
+			if err != nil {
+				logger.Printf("Unable to get value for key '%s' (will wait 30s): %v", key, err)
+				time.Sleep(30 * time.Second)
+				continue
 			}
+
+			if kv == nil {
+				logger.Printf("Key '%s' does not exists (will wait 15s)", key)
+				time.Sleep(15 * time.Second)
+				continue
+			}
+
+			if qo.WaitIndex == kv.ModifyIndex {
+				logger.Printf("Key '%s' did not changed", key)
+				continue
+			}
+
+			logger.Printf("Key '%s' did changed", key)
+
+			qo.WaitIndex = kv.ModifyIndex
+
+			var yml map[interface{}]interface{}
+			err = yaml.Unmarshal(kv.Value, &yml)
+			if err != nil {
+				logger.Printf("Unable to unmarshal YAML: %v\n%s", err, string(kv.Value))
+				continue
+			}
+
+			services, ok := yml["services"].(map[interface{}]interface{})
+			if !ok {
+				logger.Printf("Unable to get services from data: %#v", services)
+			}
+
+		withNextService:
+			for serviceName, service := range services {
+				if service, ok := service.(map[interface{}]interface{}); ok {
+					if labels, ok := service["labels"].([]interface{}); ok {
+						for _, label := range labels {
+							if label, ok := label.(string); ok {
+								for _, filter := range filters {
+									if label == filter {
+										logger.Printf("Keeps service '%s' because of label '%s'", serviceName, label)
+										continue withNextService
+									}
+								}
+							}
+						}
+
+					}
+				}
+				logger.Printf("Ignore service '%s'", serviceName)
+				delete(services, serviceName)
+			}
+
+			data, err := yaml.Marshal(yml)
+			if err != nil {
+				logger.Printf("Unable to marshal YAML: %v\n%#v", err, yml)
+				continue
+			}
+
+			logger.Printf("Write to YAML to '%s'\n%s", composeFilePath, string(data))
+
+			err = ioutil.WriteFile(composeFilePath, data, os.ModePerm)
+			if err != nil {
+				logger.Printf("Unable to write compose content into '%s': %v", composeFilePath, err)
+				continue
+			}
+
+			var cmd *exec.Cmd
+			if len(services) == 0 {
+				logger.Printf("Compose down")
+				cmd = exec.Command("docker-compose", "down", "--remove-orphans")
+			} else {
+				logger.Printf("Compose up")
+				cmd = exec.Command("docker-compose", "up", "--remove-orphans", "-d")
+			}
+			cmd.Dir = workDir
+			cmd.Stdout = &loggerWriter
+			cmd.Stderr = &loggerWriter
 			err = cmd.Run()
 			if err != nil {
-				log.Error("Unable to docker-compose down ", err)
-				return
+				logger.Printf("Unable to compose for '%s': %v", composeFilePath, err)
+				continue
 			}
-			err = os.Remove(projectFile)
-			if err != nil {
-				log.Error("Unable to remove ", projectFile, err)
-				return
-			}
+			logger.Printf("Composed!")
 		}
-		return
-	}
-	if err := ioutil.WriteFile(projectFile, []byte(yml), os.ModePerm); err != nil {
-		log.Error("Unable to write to file ", projectFile)
-		return
-	}
-	cmd := exec.Command("docker-compose", "up", "-d", "--remove-orphans")
-	log.Info("Execute docker-compose up in ", projectDir)
-	cmd.Dir = projectDir
-	if log.GetLevel() >= log.InfoLevel {
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-	}
-	err := cmd.Run()
-	if err != nil {
-		log.Error("Unable to docker-compose up", err)
-	}
+
+	}()
+
+	signalChan := make(chan os.Signal, 1)
+	signal.Notify(signalChan, os.Interrupt)
+	<-signalChan
+
+	cmd := exec.Command("docker-compose", "down", "--remove-orphans")
+	cmd.Dir = workDir
+	cmd.Stdout = &loggerWriter
+	cmd.Stderr = &loggerWriter
+	cmd.Run()
 }
