@@ -138,19 +138,38 @@ func main() {
 			if len(services) == 0 {
 				logger.Printf("Compose down")
 				cmd = exec.Command("docker-compose", "down", "--remove-orphans")
+				cmd.Dir = workDir
+				cmd.Stdout = &loggerWriter
+				cmd.Stderr = &loggerWriter
+				err = cmd.Run()
+				if err != nil {
+					logger.Printf("Unable to compose down for '%s': %v", composeFilePath, err)
+					continue
+				}
+				logger.Printf("Composed down!")
 			} else {
+				logger.Printf("Compose pull")
+				cmd = exec.Command("docker-compose", "pull")
+				cmd.Dir = workDir
+				cmd.Stdout = &loggerWriter
+				cmd.Stderr = &loggerWriter
+				err = cmd.Run()
+				if err != nil {
+					logger.Printf("Unable to compose pull for '%s': %v", composeFilePath, err)
+					continue
+				}
 				logger.Printf("Compose up")
 				cmd = exec.Command("docker-compose", "up", "--remove-orphans", "-d")
+				cmd.Dir = workDir
+				cmd.Stdout = &loggerWriter
+				cmd.Stderr = &loggerWriter
+				err = cmd.Run()
+				if err != nil {
+					logger.Printf("Unable to compose up for '%s': %v", composeFilePath, err)
+					continue
+				}
+				logger.Printf("Composed up!")
 			}
-			cmd.Dir = workDir
-			cmd.Stdout = &loggerWriter
-			cmd.Stderr = &loggerWriter
-			err = cmd.Run()
-			if err != nil {
-				logger.Printf("Unable to compose for '%s': %v", composeFilePath, err)
-				continue
-			}
-			logger.Printf("Composed!")
 		}
 
 	}()
